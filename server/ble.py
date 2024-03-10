@@ -17,9 +17,9 @@ from bless import (  # type: ignore
     GATTAttributePermissions,
 )
 
-from .secrets import HA_AUTH, HA_ENDPOINT
+from secrets import HA_AUTH, HA_ENDPOINT
 
-SERVER_NAME = "SeedPaperBLEServer"
+SERVER_NAME = "SPServer"  # must be shorter than 10 characters
 SERVICE_UUID = "D2EA587F-19C8-4F4C-8179-3BA0BC150B01"
 CHARACTERISTICS = [
     "0DF8D897-33FE-4AF4-9E7A-63D24664C94C",
