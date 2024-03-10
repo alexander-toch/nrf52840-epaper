@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "*.hoare": "c",
+        "string": "cpp"
+    }
+}
