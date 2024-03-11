@@ -60,7 +60,7 @@ async def run(loop):
     # get intial data
     data = (await get_ha_data()).encode("utf-8")
     print(f"Data type: {type(data)}, length: {len(data)}")
-    split_val = 245
+    split_val = 240
     values = [data[i : i + split_val] for i in range(0, len(data), split_val)]
 
     print(f"We will need {len(values)} characteristics")
