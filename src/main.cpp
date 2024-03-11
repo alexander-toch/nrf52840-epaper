@@ -12,7 +12,7 @@
 #include <glyphs/icons.h>
 #include <glyphs/weather_small.h>
 
-// #define SERIAL_DEBUG
+#define SERIAL_DEBUG
 
 // select the display class and display driver class in the following file (new style):
 #include "paper-config/GxEPD2_display_selection_new_style.h"
@@ -23,6 +23,10 @@ BLEClientCharacteristic characteristic1("0DF8D897-33FE-4AF4-9E7A-63D24664C94C");
 BLEClientCharacteristic characteristic2("0DF8D897-33FE-4AF4-9E7A-63D24664C94D");
 BLEClientCharacteristic characteristic3("0DF8D897-33FE-4AF4-9E7A-63D24664C94E");
 BLEClientCharacteristic characteristic4("0DF8D897-33FE-4AF4-9E7A-63D24664C94F");
+BLEConnection *connection;
+
+const size_t TIME_REFRESH = 15 * 1000;
+const size_t TIME_RETRY_SCAN = 60 * 1000;
 
 void writeSerial(String message, bool newLine = true)
 {
@@ -59,8 +63,11 @@ typedef struct
     float weather_forecast_8h_temp;
     String weather_forecast_8h_time;
     String time;
-    String timestamp;
+    String last_updated;
 } HAData;
+HAData haData;
+
+void parseData(String input, HAData &haData);
 
 void scan_callback(ble_gap_evt_adv_report_t *report)
 {
@@ -70,31 +77,9 @@ void scan_callback(ble_gap_evt_adv_report_t *report)
 
 void connect_callback(uint16_t conn_handle)
 {
-    BLEConnection *connection = Bluefruit.Connection(conn_handle);
-    char peer_name[32] = {0};
-    connection->getPeerName(peer_name, sizeof(peer_name));
-
-    writeSerial("Connected to ", false);
-    writeSerial(peer_name);
-
-    service.discover(conn_handle);
-    characteristic1.discover();
-    characteristic2.discover();
-    characteristic3.discover();
-    characteristic4.discover();
-
-    HAData haData;
-    char data[256] = {0};
-    int bytes_received = characteristic1.read(data, 1);
-    data[255] = 0;
-
-    writeSerial("Data: ", false);
-    writeSerial(String(data));
-
-    digitalWrite(LED_BLUE, HIGH);
     digitalWrite(LED_GREEN, LOW);
 
-    Bluefruit.disconnect(conn_handle);
+    connection = Bluefruit.Connection(conn_handle);
 }
 
 void disconnect_callback(uint16_t conn_handle, uint8_t reason)
@@ -103,18 +88,17 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason)
     (void)reason;
 
     writeSerial("Disconnected");
-
-    digitalWrite(LED_BLUE, HIGH);
     digitalWrite(LED_GREEN, HIGH);
-
-    Bluefruit.Scanner.stop();
-    // NRF_POWER->SYSTEMOFF = 1;
-    sd_power_mode_set(NRF_POWER_MODE_LOWPWR);
-    delay(300 * 1000);
+    // Bluefruit.Scanner.stop();
 }
 
 void setup()
 {
+#ifdef SERIAL_DEBUG
+    Serial.begin(9600);
+    delay(1000);
+#endif
+
     pinMode(LED_RED, OUTPUT);
     pinMode(LED_BLUE, OUTPUT);
     pinMode(LED_GREEN, OUTPUT);
@@ -123,14 +107,11 @@ void setup()
     digitalWrite(LED_GREEN, HIGH);
 
     // power management
-    NRF_POWER->DCDCEN = 1;
-    NRF_POWER->TASKS_LOWPWR = 1;
+    sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
+    sd_power_mode_set(NRF_POWER_MODE_LOWPWR);
 
-#ifdef SERIAL_DEBUG
-    Serial.begin(9600);
-    while (!Serial)
-        delay(10);
-#endif
+    // bluetooth
+    Bluefruit.configCentralBandwidth(BANDWIDTH_MAX);
 
     if (!Bluefruit.begin(0, 1))
     {
@@ -138,53 +119,9 @@ void setup()
         return;
     }
     writeSerial("SeedPaperBLEClient initialized");
-
-    service.begin();
-    Bluefruit.setName("SeedPaperBLECentral");
-
-    characteristic1.begin();
-    characteristic2.begin();
-    characteristic3.begin();
-    characteristic4.begin();
-
-    Bluefruit.autoConnLed(false);
-    Bluefruit.Scanner.setRxCallback(scan_callback);
-    Bluefruit.Central.setConnectCallback(connect_callback);
-    Bluefruit.Central.setDisconnectCallback(disconnect_callback);
-    Bluefruit.Scanner.restartOnDisconnect(false);
-    // Bluefruit.Scanner.setInterval(32, 244); // in unit of 0.625 ms
-    Bluefruit.Scanner.filterUuid(service.uuid);
-    Bluefruit.Scanner.useActiveScan(false);
-    Bluefruit.Scanner.start(0);
-    writeSerial("Scanning for devices...");
 }
 
-// String readCharacteristic(BLEDevice peripheral, BLEService service, String characteristic_uuid)
-// {
-//     BLECharacteristic characteristic = service.characteristic(characteristic_uuid.c_str());
-//     char val[1024] = {0};
-//     if (characteristic.canRead())
-//     {
-//         int success = characteristic.read();
-//         if (success == 0)
-//         {
-// #ifdef SERIAL_DEBUG
-//             writeSerial"Characteristic read failed.");
-// #endif
-//         }
-//         else
-//         {
-// #ifdef SERIAL_DEBUG
-//            writeSerial("Characteristic read success. Bytes read: ");
-//             writeSerialcharacteristic.valueLength());
-// #endif
-//             characteristic.readValue(val, characteristic.valueLength());
-//         }
-//     }
-//     return String(val);
-// }
-
-void getData(String input, HAData &haData)
+void parseData(String input, HAData &haData)
 {
     JsonDocument doc;
     deserializeJson(doc, input);
@@ -207,9 +144,96 @@ void getData(String input, HAData &haData)
     haData.weather_forecast_8h_temp = doc["attributes"]["weather_forecast_8h_temp"].as<float>();
     haData.weather_forecast_8h_time = doc["attributes"]["weather_forecast_8h_time"].as<String>();
     haData.time = doc["attributes"]["time"].as<String>();
-    haData.timestamp = doc["attributes"]["timestamp"].as<String>();
+    haData.last_updated = doc["last_updated"].as<String>();
 }
-
+bool firstRun = true;
 void loop()
 {
+    service.begin();
+    Bluefruit.setName("SeedPaperBLECentral");
+
+    characteristic1.begin();
+    characteristic2.begin();
+    characteristic3.begin();
+    characteristic4.begin();
+
+    Bluefruit.autoConnLed(false);
+    Bluefruit.Scanner.setRxCallback(scan_callback);
+    Bluefruit.Central.setConnectCallback(connect_callback);
+    Bluefruit.Central.setDisconnectCallback(disconnect_callback);
+    Bluefruit.Scanner.restartOnDisconnect(false);
+    Bluefruit.Advertising.setFastTimeout(30);
+    // Bluefruit.Scanner.setInterval(32, 244); // in unit of 0.625 ms
+    Bluefruit.Scanner.filterUuid(service.uuid);
+    Bluefruit.Scanner.useActiveScan(false);
+
+    if (firstRun)
+    {
+        Bluefruit.Scanner.start(500); // Scan timeout in 10 ms units
+        firstRun = false;
+    }
+    else if (Bluefruit.Scanner.isRunning())
+    {
+        writeSerial("Scanning...");
+        delay(100);
+    }
+    else if (Bluefruit.Central.connected())
+    {
+        connection->requestPHY();
+        connection->requestDataLengthUpdate();
+        connection->requestMtuExchange(BLE_GATT_ATT_MTU_MAX);
+        delay(500);
+
+        char peer_name[32] = {0};
+        connection->getPeerName(peer_name, sizeof(peer_name));
+
+        writeSerial("Connected to ", false);
+        writeSerial(peer_name, false);
+        writeSerial(" with max Mtu: ", false);
+        writeSerial(String(connection->getMtu()));
+
+        service.discover(connection->handle());
+        characteristic1.discover();
+        characteristic2.discover();
+        characteristic3.discover();
+        characteristic4.discover();
+
+        const size_t CHARACTERISTIC_MAX_DATA_LEN = connection->getMtu() - 3;
+        char buffer[4 * CHARACTERISTIC_MAX_DATA_LEN] = {0};
+        char *current_pos = buffer;
+
+        size_t bytes_received = characteristic1.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
+        current_pos += bytes_received - 4; // oh god why is it 4?
+        bytes_received = characteristic2.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
+        current_pos += bytes_received - 4;
+        bytes_received = characteristic3.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
+        current_pos += bytes_received - 4;
+        bytes_received = characteristic4.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
+        current_pos += bytes_received - 4;
+        memset(current_pos, 0, buffer + sizeof(buffer) - current_pos);
+
+        String data = String(buffer);
+        parseData(String(data), haData);
+        writeSerial(String(data));
+        writeSerial("Last updated: " + String(haData.last_updated));
+        writeSerial("Temperature inside: " + String(haData.temperature_inside));
+
+        Bluefruit.disconnect(connection->handle()); // TODO: can this be done earlier?
+
+        if (haData.last_updated == "null")
+        {
+            writeSerial("Last updated is null. Trying again.");
+            Bluefruit.Scanner.start(500);
+        }
+        else
+        {
+            delay(TIME_REFRESH);
+        }
+    }
+    else
+    {
+        writeSerial("Nothing found. Trying again in some seconds.");
+        delay(TIME_RETRY_SCAN);
+        Bluefruit.Scanner.start(500); // Scan timeout in 10 ms units
+    }
 }
