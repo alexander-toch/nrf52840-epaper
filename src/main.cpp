@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <bluefruit.h>
 #include <ArduinoJson.h>
+#include <SPI.h>
 
 #include <GxEPD2_BW.h>
 #include <GxEPD2_3C.h>
@@ -94,6 +95,7 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason)
 
 void setup()
 {
+
 #ifdef SERIAL_DEBUG
     Serial.begin(9600);
     delay(1000);
@@ -105,6 +107,12 @@ void setup()
     digitalWrite(LED_RED, HIGH);
     digitalWrite(LED_BLUE, HIGH);
     digitalWrite(LED_GREEN, HIGH);
+
+    // nrf_gpio_cfg_input(D3, NRF_GPIO_PIN_NOPULL);   // BUSY
+    // nrf_gpio_cfg_input(D10, NRF_GPIO_PIN_NOPULL);  // MOSI
+    // nrf_gpio_cfg_input(D8, NRF_GPIO_PIN_NOPULL);   // SCLK
+    // nrf_gpio_cfg_input(D7, NRF_GPIO_PIN_PULLDOWN); // CS
+    // nrf_gpio_cfg_input(D4, NRF_GPIO_PIN_PULLDOWN); // RST
 
     // power management
     sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
@@ -118,7 +126,30 @@ void setup()
         writeSerial("failed to initialize BLE!");
         return;
     }
+    delay(1000);
     writeSerial("SeedPaperBLEClient initialized");
+
+    // display
+    display.init(115200, true, 10, true); //, true, 2, false); // initial = true
+    delay(500);
+    display.setFullWindow();
+    display.setRotation(1);
+
+    display.firstPage();
+
+    do
+    {
+        display.setFont(&GothamRounded_Book14pt8b);
+        display.setTextSize(1);
+        display.setTextColor(GxEPD_BLACK);
+        display.write("\n");
+        display.write("Test");
+    } while (display.nextPage());
+
+    int error = display.getWriteError();
+
+    Serial.print("ePaper display error = ");
+    Serial.println(error);
 }
 
 void parseData(String input, HAData &haData)
@@ -211,24 +242,23 @@ void loop()
         bytes_received = characteristic4.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
         current_pos += bytes_received - 4;
         memset(current_pos, 0, buffer + sizeof(buffer) - current_pos);
+        Bluefruit.disconnect(connection->handle());
 
         String data = String(buffer);
         parseData(String(data), haData);
         writeSerial(String(data));
-        writeSerial("Last updated: " + String(haData.last_updated));
-        writeSerial("Temperature inside: " + String(haData.temperature_inside));
-
-        Bluefruit.disconnect(connection->handle()); // TODO: can this be done earlier?
 
         if (haData.last_updated == "null")
         {
             writeSerial("Last updated is null. Trying again.");
             Bluefruit.Scanner.start(500);
+            return;
         }
-        else
-        {
-            delay(TIME_REFRESH);
-        }
+        writeSerial("Last updated: " + String(haData.last_updated));
+        writeSerial("Temperature inside: " + String(haData.temperature_inside));
+
+        delay(TIME_REFRESH);
+        Bluefruit.Scanner.start(500);
     }
     else
     {
