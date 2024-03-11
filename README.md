@@ -11,3 +11,4 @@ Links:
 - https://github.com/platformio/platform-nordicnrf52/pull/151
 - https://forums.adafruit.com/viewtopic.php?t=128823
 - https://github.com/adafruit/Adafruit_nRF52_Bootloader/releases
+- https://files.waveshare.com/upload/4/4e/2.13inch_e-Paper_V4_Specification.pdf
