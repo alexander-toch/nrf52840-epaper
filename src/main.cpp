@@ -26,7 +26,7 @@ BLEClientCharacteristic characteristic3("0DF8D897-33FE-4AF4-9E7A-63D24664C94E");
 BLEClientCharacteristic characteristic4("0DF8D897-33FE-4AF4-9E7A-63D24664C94F");
 BLEConnection *connection;
 
-const size_t TIME_REFRESH = 15 * 1000;
+const size_t TIME_REFRESH = 10 * 1000;
 const size_t TIME_RETRY_SCAN = 60 * 1000;
 
 void writeSerial(String message, bool newLine = true)
@@ -108,16 +108,6 @@ void setup()
     digitalWrite(LED_BLUE, HIGH);
     digitalWrite(LED_GREEN, HIGH);
 
-    // nrf_gpio_cfg_input(D3, NRF_GPIO_PIN_NOPULL);   // BUSY
-    // nrf_gpio_cfg_input(D10, NRF_GPIO_PIN_NOPULL);  // MOSI
-    // nrf_gpio_cfg_input(D8, NRF_GPIO_PIN_NOPULL);   // SCLK
-    // nrf_gpio_cfg_input(D7, NRF_GPIO_PIN_PULLDOWN); // CS
-    // nrf_gpio_cfg_input(D4, NRF_GPIO_PIN_PULLDOWN); // RST
-
-    // power management
-    sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
-    sd_power_mode_set(NRF_POWER_MODE_LOWPWR);
-
     // bluetooth
     Bluefruit.configCentralBandwidth(BANDWIDTH_MAX);
 
@@ -129,27 +119,28 @@ void setup()
     delay(1000);
     writeSerial("SeedPaperBLEClient initialized");
 
+    // power management
+    sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
+    sd_power_mode_set(NRF_POWER_MODE_LOWPWR);
+
     // display
-    display.init(115200, true, 10, true); //, true, 2, false); // initial = true
-    delay(500);
+    display.init(115200, true, 10, false); //, true, 2, false); // initial = true
     display.setFullWindow();
     display.setRotation(1);
 
-    display.firstPage();
+    // TODO: deep sleep
+    // https://github.com/waveshareteam/e-Paper/issues/15
+    // nrf_gpio_cfg_input(D4, NRF_GPIO_PIN_PULLUP); // RST needs to be pulled up for deepsleep to work properly.
+    // prevent parasitic current consumption
+    // pinMode(D3, INPUT);  // BUSY
+    // pinMode(D5, INPUT);  // RST
+    // pinMode(D7, INPUT);  // CS
+    // pinMode(D8, INPUT);  // CLK
+    // pinMode(D10, INPUT); // DIN
 
-    do
-    {
-        display.setFont(&GothamRounded_Book14pt8b);
-        display.setTextSize(1);
-        display.setTextColor(GxEPD_BLACK);
-        display.write("\n");
-        display.write("Test");
-    } while (display.nextPage());
-
-    int error = display.getWriteError();
-
-    Serial.print("ePaper display error = ");
-    Serial.println(error);
+    // GxEPD2_213_B74.cpp
+    // delay(500);
+    // display.powerOff();
 }
 
 void parseData(String input, HAData &haData)
@@ -178,6 +169,7 @@ void parseData(String input, HAData &haData)
     haData.last_updated = doc["last_updated"].as<String>();
 }
 bool firstRun = true;
+size_t refreshCount = 0;
 void loop()
 {
     service.begin();
@@ -256,6 +248,33 @@ void loop()
         }
         writeSerial("Last updated: " + String(haData.last_updated));
         writeSerial("Temperature inside: " + String(haData.temperature_inside));
+        refreshCount++;
+
+        pinMode(D4, OUTPUT);                   // RST pin
+        display.init(115200, false, 2, false); // wake up
+        if (refreshCount > 1)
+        {
+            // 122x250 -> 120x248
+            // TODO: check partial refresh
+            // display.setPartialWindow(0, 0, 248, 120); // TODO: case for multiple of 8 needs to be fixed
+        }
+        display.firstPage();
+        do
+        {
+            display.setCursor(0, 0);
+            display.setFont(&GothamRounded_Book14pt8b);
+            display.setTextSize(1);
+            display.setTextColor(GxEPD_BLACK);
+            display.write("\n");
+            display.write("Count: ");
+            display.write(String(refreshCount).c_str());
+        } while (display.nextPage());
+        display.hibernate();
+
+        delay(100);
+        // force power saving
+        pinMode(D4, INPUT); // RST
+        SPI.end();
 
         delay(TIME_REFRESH);
         Bluefruit.Scanner.start(500);
