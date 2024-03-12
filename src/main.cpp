@@ -45,6 +45,7 @@ void hibernateDisplay();
 
 int serial_enabled = 0;
 size_t refresh_count = 0;
+size_t scan_count = 0;
 
 void setup()
 {
@@ -90,6 +91,15 @@ void loop()
     if (Bluefruit.Scanner.isRunning())
     {
         writeSerial("Scanning...");
+        scan_count++;
+
+        if (scan_count > 500)
+        {
+            Bluefruit.Scanner.stop();
+            delay(500);
+            scan_count = 0;
+            return;
+        }
         delay(100);
     }
     else if (Bluefruit.Central.connected())
@@ -108,6 +118,13 @@ void loop()
         writeSerial(String(connection->getMtu()));
 
         service.discover(connection->handle());
+        if (!service.discovered())
+        {
+            writeSerial("Service not discovered. Trying again.");
+            delay(500);
+            startScan();
+            return;
+        }
         characteristic1.discover();
         characteristic2.discover();
         characteristic3.discover();
@@ -233,6 +250,8 @@ void connect_callback(uint16_t conn_handle)
 {
     writeSerial("Connected");
     connection = Bluefruit.Connection(conn_handle);
+    delay(100);
+    writeSerial("set connection to handle");
     // FIXME: move characteristic read + display update here?
 }
 
