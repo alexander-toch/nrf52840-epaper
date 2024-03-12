@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <bluefruit.h>
-#include <ArduinoJson.h>
 #include <SPI.h>
 
 #include <GxEPD2_BW.h>
@@ -12,101 +11,51 @@
 #include <glyphs/weather.h>
 #include <glyphs/icons.h>
 #include <glyphs/weather_small.h>
-
-#define SERIAL_DEBUG
-
-// select the display class and display driver class in the following file (new style):
 #include "paper-config/GxEPD2_display_selection_new_style.h"
+#include "home_assistant.h"
 
-// Advertising parameters should have a global scope. Do NOT define them in 'setup' or in 'loop'
+// Refresh interval of HA data and display
+const size_t TIME_REFRESH = 5 * 1000;
+
+// Retry interval if no peripheral (server) is found
+const size_t TIME_RETRY_SCAN = 60 * 1000;
+
+// Advertising/Central parameters should have a global scope. Do NOT define them in 'setup' or in 'loop'
 BLEClientService service("D2EA587F-19C8-4F4C-8179-3BA0BC150B01");
+
+// we use 4 characteristics in order to fit the whole HA JSON data
+// as we are limited to 247 bytes per characteristic
+// see https://devzone.nordicsemi.com/f/nordic-q-a/35927/max-data-length-over-ble
 BLEClientCharacteristic characteristic1("0DF8D897-33FE-4AF4-9E7A-63D24664C94C");
 BLEClientCharacteristic characteristic2("0DF8D897-33FE-4AF4-9E7A-63D24664C94D");
 BLEClientCharacteristic characteristic3("0DF8D897-33FE-4AF4-9E7A-63D24664C94E");
 BLEClientCharacteristic characteristic4("0DF8D897-33FE-4AF4-9E7A-63D24664C94F");
+
+// Handle for current connection
 BLEConnection *connection;
 
-const size_t TIME_REFRESH = 10 * 1000;
-const size_t TIME_RETRY_SCAN = 60 * 1000;
+// forward declarations
+void writeSerial(String message, bool newLine = true);
+void scan_callback(ble_gap_evt_adv_report_t *report);
+void connect_callback(uint16_t conn_handle);
+void disconnect_callback(uint16_t conn_handle, uint8_t reason);
+void initDisplay();
+void startScan();
+void hibernateDisplay();
 
-void writeSerial(String message, bool newLine = true)
-{
-#ifdef SERIAL_DEBUG
-    if (newLine == true)
-    {
-        Serial.println(message);
-    }
-    else
-    {
-        Serial.print(message);
-    }
-#endif
-}
-
-typedef struct
-{
-    float temperature_inside;
-    float humidity_inside;
-    float temperature_outside;
-    float humidity_outside;
-    float wind_speed;
-    String weather_forecast_now;
-    String weather_forecast_2h;
-    float weather_forecast_2h_temp;
-    String weather_forecast_2h_time;
-    String weather_forecast_4h;
-    float weather_forecast_4h_temp;
-    String weather_forecast_4h_time;
-    String weather_forecast_6h;
-    float weather_forecast_6h_temp;
-    String weather_forecast_6h_time;
-    String weather_forecast_8h;
-    float weather_forecast_8h_temp;
-    String weather_forecast_8h_time;
-    String time;
-    String last_updated;
-} HAData;
-HAData haData;
-
-void parseData(String input, HAData &haData);
-
-void scan_callback(ble_gap_evt_adv_report_t *report)
-{
-    writeSerial("Connecting...");
-    Bluefruit.Central.connect(report);
-}
-
-void connect_callback(uint16_t conn_handle)
-{
-    digitalWrite(LED_GREEN, LOW);
-
-    connection = Bluefruit.Connection(conn_handle);
-}
-
-void disconnect_callback(uint16_t conn_handle, uint8_t reason)
-{
-    (void)conn_handle;
-    (void)reason;
-
-    writeSerial("Disconnected");
-    digitalWrite(LED_GREEN, HIGH);
-    // Bluefruit.Scanner.stop();
-}
+int serial_enabled = 0;
+size_t refresh_count = 0;
 
 void setup()
 {
-
-#ifdef SERIAL_DEBUG
-    Serial.begin(9600);
-    delay(1000);
-#endif
-
-    pinMode(LED_RED, OUTPUT);
-    pinMode(LED_BLUE, OUTPUT);
-    pinMode(LED_GREEN, OUTPUT);
-    digitalWrite(LED_RED, HIGH);
-    digitalWrite(LED_BLUE, HIGH);
-    digitalWrite(LED_GREEN, HIGH);
+    serial_enabled = bitRead(NRF_POWER->USBREGSTATUS, 0); // VBUSDETECT - USB supply status
+    if (serial_enabled == 1)
+    {
+        Serial.begin(9600);
+        while (!Serial)
+            ;
+        serial_enabled = 1;
+    }
 
     // bluetooth
     Bluefruit.configCentralBandwidth(BANDWIDTH_MAX);
@@ -116,86 +65,29 @@ void setup()
         writeSerial("failed to initialize BLE!");
         return;
     }
-    delay(1000);
-    writeSerial("SeedPaperBLEClient initialized");
-
-    // power management
-    sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
-    sd_power_mode_set(NRF_POWER_MODE_LOWPWR);
-
-    // display
-    display.init(115200, true, 10, false); //, true, 2, false); // initial = true
-    display.setFullWindow();
-    display.setRotation(1);
-
-    // TODO: deep sleep
-    // https://github.com/waveshareteam/e-Paper/issues/15
-    // nrf_gpio_cfg_input(D4, NRF_GPIO_PIN_PULLUP); // RST needs to be pulled up for deepsleep to work properly.
-    // prevent parasitic current consumption
-    // pinMode(D3, INPUT);  // BUSY
-    // pinMode(D5, INPUT);  // RST
-    // pinMode(D7, INPUT);  // CS
-    // pinMode(D8, INPUT);  // CLK
-    // pinMode(D10, INPUT); // DIN
-
-    // GxEPD2_213_B74.cpp
-    // delay(500);
-    // display.powerOff();
-}
-
-void parseData(String input, HAData &haData)
-{
-    JsonDocument doc;
-    deserializeJson(doc, input);
-    haData.temperature_inside = doc["attributes"]["temperature_inside"].as<float>();
-    haData.humidity_inside = doc["attributes"]["humidity_inside"].as<float>();
-    haData.temperature_outside = doc["attributes"]["temperature_outside"].as<float>();
-    haData.humidity_outside = doc["attributes"]["humidity_outside"].as<float>();
-    haData.wind_speed = doc["attributes"]["wind_speed"].as<float>();
-    haData.weather_forecast_now = doc["attributes"]["weather_forecast_now"].as<String>();
-    haData.weather_forecast_2h = doc["attributes"]["weather_forecast_2h"].as<String>();
-    haData.weather_forecast_2h_temp = doc["attributes"]["weather_forecast_2h_temp"].as<float>();
-    haData.weather_forecast_2h_time = doc["attributes"]["weather_forecast_2h_time"].as<String>();
-    haData.weather_forecast_4h = doc["attributes"]["weather_forecast_4h"].as<String>();
-    haData.weather_forecast_4h_temp = doc["attributes"]["weather_forecast_4h_temp"].as<float>();
-    haData.weather_forecast_4h_time = doc["attributes"]["weather_forecast_4h_time"].as<String>();
-    haData.weather_forecast_6h = doc["attributes"]["weather_forecast_6h"].as<String>();
-    haData.weather_forecast_6h_temp = doc["attributes"]["weather_forecast_6h_temp"].as<float>();
-    haData.weather_forecast_6h_time = doc["attributes"]["weather_forecast_6h_time"].as<String>();
-    haData.weather_forecast_8h = doc["attributes"]["weather_forecast_8h"].as<String>();
-    haData.weather_forecast_8h_temp = doc["attributes"]["weather_forecast_8h_temp"].as<float>();
-    haData.weather_forecast_8h_time = doc["attributes"]["weather_forecast_8h_time"].as<String>();
-    haData.time = doc["attributes"]["time"].as<String>();
-    haData.last_updated = doc["last_updated"].as<String>();
-}
-bool firstRun = true;
-size_t refreshCount = 0;
-void loop()
-{
     service.begin();
-    Bluefruit.setName("SeedPaperBLECentral");
-
     characteristic1.begin();
     characteristic2.begin();
     characteristic3.begin();
     characteristic4.begin();
 
-    Bluefruit.autoConnLed(false);
-    Bluefruit.Scanner.setRxCallback(scan_callback);
-    Bluefruit.Central.setConnectCallback(connect_callback);
-    Bluefruit.Central.setDisconnectCallback(disconnect_callback);
-    Bluefruit.Scanner.restartOnDisconnect(false);
-    Bluefruit.Advertising.setFastTimeout(30);
-    // Bluefruit.Scanner.setInterval(32, 244); // in unit of 0.625 ms
-    Bluefruit.Scanner.filterUuid(service.uuid);
-    Bluefruit.Scanner.useActiveScan(false);
+    // power management
+    sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
+    sd_power_mode_set(NRF_POWER_MODE_LOWPWR);
 
-    if (firstRun)
-    {
-        Bluefruit.Scanner.start(500); // Scan timeout in 10 ms units
-        firstRun = false;
-    }
-    else if (Bluefruit.Scanner.isRunning())
+    // init display
+    initDisplay();
+    hibernateDisplay();
+    writeSerial("setup completed");
+
+    startScan();
+}
+
+void loop()
+{
+    serial_enabled = bitRead(NRF_POWER->USBREGSTATUS, 0);
+
+    if (Bluefruit.Scanner.isRunning())
     {
         writeSerial("Scanning...");
         delay(100);
@@ -226,38 +118,32 @@ void loop()
         char *current_pos = buffer;
 
         size_t bytes_received = characteristic1.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
-        current_pos += bytes_received - 4; // oh god why is it 4?
+        current_pos += bytes_received;
         bytes_received = characteristic2.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
-        current_pos += bytes_received - 4;
+        current_pos += bytes_received;
         bytes_received = characteristic3.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
-        current_pos += bytes_received - 4;
+        current_pos += bytes_received;
         bytes_received = characteristic4.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
-        current_pos += bytes_received - 4;
+        current_pos += bytes_received;
         memset(current_pos, 0, buffer + sizeof(buffer) - current_pos);
         Bluefruit.disconnect(connection->handle());
 
         String data = String(buffer);
-        parseData(String(data), haData);
+        parseHomeAssistantData(String(data), haData);
         writeSerial(String(data));
 
         if (haData.last_updated == "null")
         {
             writeSerial("Last updated is null. Trying again.");
-            Bluefruit.Scanner.start(500);
+            delay(500);
+            startScan();
             return;
         }
         writeSerial("Last updated: " + String(haData.last_updated));
         writeSerial("Temperature inside: " + String(haData.temperature_inside));
-        refreshCount++;
 
-        pinMode(D4, OUTPUT);                   // RST pin
-        display.init(115200, false, 2, false); // wake up
-        if (refreshCount > 1)
-        {
-            // 122x250 -> 120x248
-            // TODO: check partial refresh
-            // display.setPartialWindow(0, 0, 248, 120); // TODO: case for multiple of 8 needs to be fixed
-        }
+        display.init(115200, false, 10, false); // wake up
+        // display.setPartialWindow(0, 0, display.width(), display.height());
         display.firstPage();
         do
         {
@@ -267,22 +153,94 @@ void loop()
             display.setTextColor(GxEPD_BLACK);
             display.write("\n");
             display.write("Count: ");
-            display.write(String(refreshCount).c_str());
+            display.write(String(refresh_count).c_str());
         } while (display.nextPage());
-        display.hibernate();
+        hibernateDisplay();
 
-        delay(100);
-        // force power saving
-        pinMode(D4, INPUT); // RST
-        SPI.end();
-
+        refresh_count++;
         delay(TIME_REFRESH);
-        Bluefruit.Scanner.start(500);
+        startScan();
     }
     else
     {
-        writeSerial("Nothing found. Trying again in some seconds.");
+        writeSerial("Nothing found during BLE scan. Trying again in some seconds.");
         delay(TIME_RETRY_SCAN);
-        Bluefruit.Scanner.start(500); // Scan timeout in 10 ms units
+        startScan();
     }
+}
+
+void startScan()
+{
+    Bluefruit.setName("SeedPaperBLE");
+    Bluefruit.autoConnLed(false);
+    Bluefruit.Scanner.setRxCallback(scan_callback);
+    Bluefruit.Central.setConnectCallback(connect_callback);
+    Bluefruit.Central.setDisconnectCallback(disconnect_callback);
+    Bluefruit.Scanner.restartOnDisconnect(false);
+    Bluefruit.Scanner.useActiveScan(false);
+    Bluefruit.Scanner.filterUuid(service.uuid);
+    Bluefruit.Scanner.start(500); // Scan timeout in 10 ms units
+    delay(100);
+}
+
+void hibernateDisplay()
+{
+    display.hibernate();
+    pinMode(D4, INPUT); // RST
+    SPI.end();
+}
+
+void writeSerial(String message, bool newLine)
+{
+    if (serial_enabled == 1)
+    {
+        if (newLine == true)
+        {
+            Serial.println(message);
+        }
+        else
+        {
+            Serial.print(message);
+        }
+    }
+}
+
+void initDisplay()
+{
+    display.init(115200, true, 10, false); //, true, 2, false); // initial = true
+    display.setPartialWindow(0, 0, display.width(), display.height());
+    display.setRotation(1);
+
+    display.firstPage();
+    do
+    {
+        display.setCursor(0, 0);
+        display.setFont(&GothamRounded_Book14pt8b);
+        display.setTextSize(1);
+        display.setTextColor(GxEPD_BLACK);
+        display.write("\n");
+        display.write("Scanning...");
+    } while (display.nextPage());
+}
+
+void scan_callback(ble_gap_evt_adv_report_t *report)
+{
+    writeSerial("Connecting...");
+    Bluefruit.Central.connect(report);
+}
+
+void connect_callback(uint16_t conn_handle)
+{
+    writeSerial("Connected");
+    connection = Bluefruit.Connection(conn_handle);
+    // FIXME: move characteristic read + display update here?
+}
+
+void disconnect_callback(uint16_t conn_handle, uint8_t reason)
+{
+    (void)conn_handle;
+    (void)reason;
+
+    writeSerial("Disconnected");
+    Bluefruit.Scanner.stop();
 }
