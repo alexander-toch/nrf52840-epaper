@@ -1,12 +1,9 @@
-"""
-Example for a BLE 4.0 Server
-"""
-
 import sys
 import logging
 import aiohttp
 import asyncio
 import threading
+import random
 
 from typing import Any, Union
 
@@ -53,17 +50,9 @@ async def get_ha_data():
         async with session.get(HA_ENDPOINT, headers=headers) as response:
             return await response.text()
 
-
+server = None
 async def run(loop):
     trigger.clear()
-
-    # get intial data
-    data = (await get_ha_data()).encode("utf-8")
-    print(f"Data type: {type(data)}, length: {len(data)}")
-    split_val = 240
-    values = [data[i : i + split_val] for i in range(0, len(data), split_val)]
-
-    print(f"We will need {len(values)} characteristics")
 
     # Instantiate the server
     server = BlessServer(name=SERVER_NAME, loop=loop)
@@ -82,13 +71,15 @@ async def run(loop):
     await server.start()
     logger.debug("Advertising")
 
-    for i, val in enumerate(values):
-        server.get_characteristic(CHARACTERISTICS[i]).value = val
-
-    if trigger.__module__ == "threading":
-        trigger.wait()
-    else:
-        await trigger.wait()
+    while True and not trigger.is_set():
+        logger.debug("Updating HA data")
+        data = (await get_ha_data()).encode("utf-8")
+        split_val = 240
+        values = [data[i : i + split_val] for i in range(0, len(data), split_val)]
+        for i, val in enumerate(values):
+            server.get_characteristic(CHARACTERISTICS[i]).value = val
+        logger.debug("Updated HA data")
+        await asyncio.sleep(60)
 
     await server.stop()
 

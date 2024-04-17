@@ -8,14 +8,13 @@
 #include <fonts/GothamRoundedBook.h>
 #include <fonts/GothamRoundedBold.h>
 #include <fonts/GothamRoundedBoldBig.h>
-#include <glyphs/weather.h>
-#include <glyphs/icons.h>
-#include <glyphs/weather_small.h>
 #include "paper-config/GxEPD2_display_selection_new_style.h"
 #include "home_assistant.h"
+#include "epaper.h"
+#include <ctime>
 
 // Refresh interval of HA data and display
-const size_t TIME_REFRESH = 5 * 1000;
+const size_t TIME_REFRESH =  2 * 60 * 1000;
 
 // Retry interval if no peripheral (server) is found
 const size_t TIME_RETRY_SCAN = 60 * 1000;
@@ -42,6 +41,7 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 void initDisplay();
 void startScan();
 void hibernateDisplay();
+void writeDisplayData();
 
 int serial_enabled = 0;
 size_t refresh_count = 0;
@@ -78,7 +78,6 @@ void setup()
 
     // init display
     initDisplay();
-    hibernateDisplay();
     writeSerial("setup completed");
 
     startScan();
@@ -93,7 +92,7 @@ void loop()
         writeSerial("Scanning...");
         scan_count++;
 
-        if (scan_count > 500)
+        if (scan_count > 100)
         {
             Bluefruit.Scanner.stop();
             delay(500);
@@ -121,6 +120,7 @@ void loop()
         if (!service.discovered())
         {
             writeSerial("Service not discovered. Trying again.");
+            connection->disconnect();
             delay(500);
             startScan();
             return;
@@ -159,19 +159,13 @@ void loop()
         writeSerial("Last updated: " + String(haData.last_updated));
         writeSerial("Temperature inside: " + String(haData.temperature_inside));
 
-        display.init(115200, false, 10, false); // wake up
+        digitalWrite(D0, HIGH); // turn on display power
+        display.init(115200, false, 2, true);        
+        // Partial refresh not working after full power off...
         // display.setPartialWindow(0, 0, display.width(), display.height());
-        display.firstPage();
-        do
-        {
-            display.setCursor(0, 0);
-            display.setFont(&GothamRounded_Book14pt8b);
-            display.setTextSize(1);
-            display.setTextColor(GxEPD_BLACK);
-            display.write("\n");
-            display.write("Count: ");
-            display.write(String(refresh_count).c_str());
-        } while (display.nextPage());
+
+        writeDisplayData();
+    
         hibernateDisplay();
 
         refresh_count++;
@@ -196,15 +190,19 @@ void startScan()
     Bluefruit.Scanner.restartOnDisconnect(false);
     Bluefruit.Scanner.useActiveScan(false);
     Bluefruit.Scanner.filterUuid(service.uuid);
+    Bluefruit.setTxPower(4); // Check Bluefruit.h for supported values
     Bluefruit.Scanner.start(500); // Scan timeout in 10 ms units
     delay(100);
 }
 
 void hibernateDisplay()
 {
+    // I don't know why these steps are needed, but there's no 
+    // other chance to get below 30 uA
     display.hibernate();
     pinMode(D4, INPUT); // RST
     SPI.end();
+    digitalWrite(D0, LOW);
 }
 
 void writeSerial(String message, bool newLine)
@@ -224,19 +222,28 @@ void writeSerial(String message, bool newLine)
 
 void initDisplay()
 {
-    display.init(115200, true, 10, false); //, true, 2, false); // initial = true
+    // pull PWR (D0) high (Power for the ePaper Driver hat)
+    pinMode(D0, OUTPUT);
+    digitalWrite(D0, HIGH);
+
+    // display.init(115200, true, 10, false); //, true, 2, false); // initial = true this is for the small display
+    display.init(115200, true, 2, true);
     display.setPartialWindow(0, 0, display.width(), display.height());
+    display.setTextColor(GxEPD_BLACK);
     display.setRotation(1);
 
+    int16_t tbx, tby;
+    uint16_t tbw, tbh;
+    display.setFont(&GothamRounded_Bold32pt7b); // title
+    display.getTextBounds(title, 0, 0, &tbx, &tby, &tbw, &tbh);
+
     display.firstPage();
+
     do
     {
-        display.setCursor(0, 0);
-        display.setFont(&GothamRounded_Book14pt8b);
-        display.setTextSize(1);
-        display.setTextColor(GxEPD_BLACK);
-        display.write("\n");
-        display.write("Scanning...");
+        // print Title
+        display.setCursor(((display.width() - tbw) / 2) - tbx - 25, OFFSET_TOP + 80);
+        display.print("Scanning...");        
     } while (display.nextPage());
 }
 
@@ -250,6 +257,7 @@ void connect_callback(uint16_t conn_handle)
 {
     writeSerial("Connected");
     connection = Bluefruit.Connection(conn_handle);
+    Bluefruit.Scanner.stop();
     delay(100);
     writeSerial("set connection to handle");
     // FIXME: move characteristic read + display update here?
@@ -261,5 +269,106 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason)
     (void)reason;
 
     writeSerial("Disconnected");
-    Bluefruit.Scanner.stop();
+}
+
+void printForecast(int offset_x, int offset_y, weather_icon icon, float temperature, String time)
+{
+  display.setFont(&GothamRounded_Book14pt8b);
+
+  display.setCursor(OFFSET_LEFT + offset_x, OFFSET_TOP + offset_y);
+  display.print(time);
+
+  display.drawBitmap(OFFSET_LEFT + offset_x + 15, OFFSET_TOP + offset_y + 8, icon, GLYPH_SIZE_WEATHER_SMALL, GLYPH_SIZE_WEATHER_SMALL, GxEPD_BLACK);
+
+  if (temperature > 9.99)
+  {
+    display.setCursor(OFFSET_LEFT + offset_x + 10, OFFSET_TOP + offset_y + 10 + GLYPH_SIZE_WEATHER_SMALL + 28);
+  }
+  else
+  {
+    display.setCursor(OFFSET_LEFT + offset_x + 15, OFFSET_TOP + offset_y + 10 + GLYPH_SIZE_WEATHER_SMALL + 28);
+  }
+  display.setFont(&GothamRounded_Bold14pt8b);
+  display.printf("%.0f°C", temperature);
+}
+
+void writeDisplayData()
+{
+  display.setRotation(1);
+
+  display.setTextColor(GxEPD_BLACK);
+  int16_t tbx, tby;
+  uint16_t tbw, tbh;
+  display.setFont(&GothamRounded_Bold32pt7b); // title
+  display.getTextBounds(title, 0, 0, &tbx, &tby, &tbw, &tbh);
+
+  display.firstPage();
+
+  do
+  {
+    // print Title
+    display.setCursor(((display.width() - tbw) / 2) - tbx, OFFSET_TOP + 80);
+    display.print(title);
+
+    // print big weather icon and temperature
+    weather_icon weather_icon = get_weather_icon(haData.weather_forecast_now);
+    display.drawBitmap(OFFSET_LEFT + 10, OFFSET_TOP + 110, weather_icon, GLYPH_SIZE_WEATHER, GLYPH_SIZE_WEATHER, GxEPD_BLACK);
+    display.setCursor(OFFSET_LEFT + 110, OFFSET_TOP + 190);
+    display.setFont(&GothamRounded_Bold48pt8b);
+    display.printf("%.1f°C", haData.temperature_outside);
+
+    // print humidity and wind
+    display.setFont(&GothamRounded_Bold14pt8b);
+    size_t weatherdetails_offset = 250;
+    display.drawBitmap(OFFSET_LEFT + 30, OFFSET_TOP + weatherdetails_offset - GLYPH_SIZE_WEATHER_SMALL / 2, weather_small_wind, GLYPH_SIZE_WEATHER_SMALL, GLYPH_SIZE_WEATHER_SMALL, GxEPD_BLACK);
+    display.setCursor(OFFSET_LEFT + 90, OFFSET_TOP + weatherdetails_offset + GLYPH_SIZE_WEATHER_SMALL / 4);
+    display.printf("%.1fkm/h", haData.wind_speed);
+
+    display.drawBitmap(OFFSET_LEFT + 230, OFFSET_TOP + weatherdetails_offset - GLYPH_SIZE_WEATHER_SMALL / 2, icon_humidity, GLYPH_SIZE_WEATHER_SMALL, GLYPH_SIZE_WEATHER_SMALL, GxEPD_BLACK);
+    display.setCursor(OFFSET_LEFT + 290, OFFSET_TOP + weatherdetails_offset + GLYPH_SIZE_WEATHER_SMALL / 4);
+    display.printf("%.1f%%", haData.humidity_outside);
+
+    // print forecasts
+    size_t forecast_offset_y = weatherdetails_offset + 60;
+    printForecast(30, forecast_offset_y, get_weather_icon(haData.weather_forecast_2h, true), haData.weather_forecast_2h_temp, haData.weather_forecast_2h_time);
+    printForecast(130, forecast_offset_y, get_weather_icon(haData.weather_forecast_4h, true), haData.weather_forecast_4h_temp, haData.weather_forecast_4h_time);
+    printForecast(230, forecast_offset_y, get_weather_icon(haData.weather_forecast_6h, true), haData.weather_forecast_6h_temp, haData.weather_forecast_6h_time);
+    printForecast(330, forecast_offset_y, get_weather_icon(haData.weather_forecast_8h, true), haData.weather_forecast_8h_temp, haData.weather_forecast_8h_time);
+
+    // living room temperature
+    display.drawBitmap(OFFSET_LEFT + 30, OFFSET_TOP + 430, icon_living_room, 80, 80, GxEPD_BLACK);
+    display.drawBitmap(OFFSET_LEFT + 120, OFFSET_TOP + 430, icon40_thermometer, 40, 40, GxEPD_BLACK);
+    display.drawBitmap(OFFSET_LEFT + 120, OFFSET_TOP + 470, icon40_humidity, 40, 40, GxEPD_BLACK);
+
+    display.setFont(&GothamRounded_Bold14pt8b);
+    display.setCursor(OFFSET_LEFT + 165, OFFSET_TOP + 460);
+    display.printf("%.1f°C", haData.temperature_inside);
+
+    display.setCursor(OFFSET_LEFT + 165, OFFSET_TOP + 500);
+    display.printf("%.1f%%", haData.humidity_inside);
+
+
+    // dog age
+    int y,M,d,h,m;
+    float s;
+    sscanf(haData.last_updated.c_str(), "%d-%d-%dT%d:%d:%f+00:00", &y, &M, &d, &h, &m, &s); // "2024-04-15T15:26:00.392326+00:00
+
+    std::tm now_tm = {0,0,0,d,M-1,y - 1900};
+    std::time_t now = std::mktime(&now_tm);
+    std::tm birthday_tm = {0,0,0,25,2,2024 - 1900}; /* March 25, 2004 */
+    std::time_t birthday = std::mktime(&birthday_tm);
+    int weeks_old = std::difftime(now, birthday) / (7 * 24 * 3600);
+
+    display.drawBitmap(OFFSET_LEFT + 30, OFFSET_TOP + 550, image_dog, 80, 50, GxEPD_BLACK);
+    display.setCursor(OFFSET_LEFT + 120, OFFSET_TOP + 585);
+    display.printf("%d Wochen", weeks_old);
+
+    display.setFont(&GothamRounded_Book14pt8b);
+    display.getTextBounds("STAND 11:11", 0, 0, &tbx, &tby, &tbw, &tbh);
+    display.setCursor(((display.width() - tbw) / 2) - tbx - 10, OFFSET_TOP + 670);
+    display.printf("STAND %s", haData.time.c_str());
+
+    // calibrate borders
+    // display.drawRect(OFFSET_LEFT, OFFSET_TOP, display.width() - OFFSET_LEFT - OFFSET_RIGHT, display.height() - OFFSET_TOP - OFFSET_BOTTOM, GxEPD_BLACK);
+  } while (display.nextPage());
 }
