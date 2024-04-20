@@ -13,8 +13,12 @@
 #include "epaper.h"
 #include <ctime>
 
+// battery level
+#define VREF 2.4
+#define ADC_MAX 4096
+
 // Refresh interval of HA data and display
-const size_t TIME_REFRESH =  2 * 60 * 1000;
+const size_t TIME_REFRESH =  5 * 60 * 1000;
 
 // Retry interval if no peripheral (server) is found
 const size_t TIME_RETRY_SCAN = 60 * 1000;
@@ -42,6 +46,7 @@ void initDisplay();
 void startScan();
 void hibernateDisplay();
 void writeDisplayData();
+float getBatteryVoltage();
 
 int serial_enabled = 0;
 size_t refresh_count = 0;
@@ -76,6 +81,13 @@ void setup()
     sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
     sd_power_mode_set(NRF_POWER_MODE_LOWPWR);
 
+    // battery level
+    analogReference(AR_INTERNAL_2_4);
+    analogReadResolution(ADC_RESOLUTION);
+    pinMode(PIN_VBAT, INPUT);
+    pinMode(VBAT_ENABLE, OUTPUT);
+    digitalWrite(VBAT_ENABLE, LOW);
+
     // init display
     initDisplay();
     writeSerial("setup completed");
@@ -89,11 +101,13 @@ void loop()
 
     if (Bluefruit.Scanner.isRunning())
     {
-        writeSerial("Scanning...");
+        writeSerial("Scanning (", false);
+        writeSerial(String(scan_count) + ")");
         scan_count++;
 
-        if (scan_count > 100)
+        if (scan_count > 150)
         {
+            writeSerial("Stopping Scanner");
             Bluefruit.Scanner.stop();
             delay(500);
             scan_count = 0;
@@ -190,8 +204,7 @@ void startScan()
     Bluefruit.Scanner.restartOnDisconnect(false);
     Bluefruit.Scanner.useActiveScan(false);
     Bluefruit.Scanner.filterUuid(service.uuid);
-    Bluefruit.setTxPower(4); // Check Bluefruit.h for supported values
-    Bluefruit.Scanner.start(500); // Scan timeout in 10 ms units
+    Bluefruit.Scanner.start(0); // Scan timeout in 10 ms units
     delay(100);
 }
 
@@ -364,6 +377,13 @@ void writeDisplayData()
     display.printf("%d Wochen", weeks_old);
 
     display.setFont(&GothamRounded_Book14pt8b);
+
+    // battery level
+    float batteryVoltage = getBatteryVoltage();
+    display.setCursor(OFFSET_LEFT + 5, OFFSET_TOP + 670);
+    display.printf("%.1fV", batteryVoltage);
+
+    // last update
     display.getTextBounds("STAND 11:11", 0, 0, &tbx, &tby, &tbw, &tbh);
     display.setCursor(((display.width() - tbw) / 2) - tbx - 10, OFFSET_TOP + 670);
     display.printf("STAND %s", haData.time.c_str());
@@ -371,4 +391,10 @@ void writeDisplayData()
     // calibrate borders
     // display.drawRect(OFFSET_LEFT, OFFSET_TOP, display.width() - OFFSET_LEFT - OFFSET_RIGHT, display.height() - OFFSET_TOP - OFFSET_BOTTOM, GxEPD_BLACK);
   } while (display.nextPage());
+}
+
+float getBatteryVoltage() {
+  unsigned int adcCount = analogRead(PIN_VBAT);
+  float adcVoltage = adcCount * VREF / ADC_MAX;
+  return ((510e3 + 1000e3) / 510e3) * adcVoltage;
 }
