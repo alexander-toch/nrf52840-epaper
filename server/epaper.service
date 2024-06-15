@@ -1,0 +1,16 @@
+[Unit]
+Description=ePaper BLE Server
+StartLimitIntervalSec=500
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/USER/ble-epaper-server
+ExecStart=/home/USER/miniconda3/envs/nrf-ble/bin/python -u /home/USER/ble-epaper-server/ble.py
+Restart=on-failure
+RestartSec=5s
+RestartSteps=30s
+
+[Install]
+WantedBy=multi-user.target
+Alias=epaper.service
