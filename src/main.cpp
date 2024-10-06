@@ -362,19 +362,22 @@ void writeDisplayData()
 
 
     // dog age
-    int y,M,d,h,m;
+    int y, M, d, h, m;
     float s;
-    sscanf(haData.last_updated.c_str(), "%d-%d-%dT%d:%d:%f+00:00", &y, &M, &d, &h, &m, &s); // "2024-04-15T15:26:00.392326+00:00
+    sscanf(haData.last_updated.c_str(), "%d-%d-%dT%d:%d:%f+00:00", &y, &M, &d, &h, &m, &s); // "2024-04-15T15:26:00.392326+00:00"
 
-    std::tm now_tm = {0,0,0,d,M-1,y - 1900};
+    std::tm now_tm = {0, 0, 0, d, M - 1, y - 1900};
     std::time_t now = std::mktime(&now_tm);
-    std::tm birthday_tm = {0,0,0,25,2,2024 - 1900}; /* March 25, 2004 */
+    std::tm birthday_tm = {0, 0, 0, 25, 2, 2024 - 1900}; /* March 25, 2024 */
     std::time_t birthday = std::mktime(&birthday_tm);
-    int weeks_old = std::difftime(now, birthday) / (7 * 24 * 3600);
+
+    int years_old = std::difftime(now, birthday) / (365.25 * 24 * 3600);
+    int months_old = (std::difftime(now, birthday) - (years_old * 365.25 * 24 * 3600)) / (30.44 * 24 * 3600);
+    int total_months_old = years_old * 12 + months_old;
 
     display.drawBitmap(OFFSET_LEFT + 30, OFFSET_TOP + 550, image_dog, 80, 50, GxEPD_BLACK);
     display.setCursor(OFFSET_LEFT + 120, OFFSET_TOP + 585);
-    display.printf("%d Wochen", weeks_old);
+    display.printf("%d Monate", total_months_old);
 
     display.setFont(&GothamRounded_Book14pt8b);
 
