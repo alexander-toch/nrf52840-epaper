@@ -6,10 +6,10 @@
 #include <WString.h>
 
 // set borders of display inside frame
-#define OFFSET_LEFT 18
-#define OFFSET_TOP 35
-#define OFFSET_RIGHT 23
-#define OFFSET_BOTTOM 80
+#define OFFSET_LEFT 38
+#define OFFSET_TOP 32
+#define OFFSET_RIGHT 4
+#define OFFSET_BOTTOM 83
 
 const char *title = "WETTER";
 const size_t GLYPH_SIZE_WEATHER = 100;

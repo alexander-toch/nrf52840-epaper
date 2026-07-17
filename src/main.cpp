@@ -1,14 +1,12 @@
 #include <Arduino.h>
 #include <bluefruit.h>
-#include <SPI.h>
 
-#include <GxEPD2_BW.h>
-#include <GxEPD2_3C.h>
-#include <GxEPD2_7C.h>
+// Display facade — selects GxEPD2 (legacy HAT) or Seeed_GFX (EN04) at build time.
+// Must precede the font headers so the GFXfont type is defined for them.
+#include "display/display.h"
 #include <fonts/GothamRoundedBook.h>
 #include <fonts/GothamRoundedBold.h>
 #include <fonts/GothamRoundedBoldBig.h>
-#include "paper-config/GxEPD2_display_selection_new_style.h"
 #include "home_assistant.h"
 #include "epaper.h"
 #include <ctime>
@@ -16,6 +14,28 @@
 // battery level
 #define VREF 2.4
 #define ADC_MAX 4096
+
+// Battery ADC configuration.
+// - XIAO nRF52840 (Sense): PIN_VBAT via VBAT_ENABLE, active LOW, 2.4V reference.
+// - XIAO ePaper Display Board EN04: A0 reads the divider, A5 enables it active
+//   HIGH, default reference + 12-bit, per the Seeed wiki battery example:
+//   https://wiki.seeedstudio.com/epaper_EN04/#user-battery-on-xiao-epaper-display-boardnrf52840---en04
+#if defined(DISPLAY_BACKEND_SEEEDGFX)
+#define BATTERY_PIN A0
+#define BATTERY_ENABLE_PIN A5
+#define BATTERY_ENABLE_ACTIVE HIGH
+#else
+#define BATTERY_PIN PIN_VBAT
+#define BATTERY_ENABLE_PIN VBAT_ENABLE
+#define BATTERY_ENABLE_ACTIVE LOW
+#endif
+
+// Debug: draw calibration borders (full panel outline + the OFFSET_* content
+// window) so the display can be aligned inside the physical picture frame.
+// Set to 1 to enable, or add `-D DEBUG_DISPLAY_BORDER=1` to the env's build_flags.
+#ifndef DEBUG_DISPLAY_BORDER
+#define DEBUG_DISPLAY_BORDER 0
+#endif
 
 // Refresh interval of HA data and display
 const size_t TIME_REFRESH = 5 * 60 * 1000;
@@ -26,7 +46,7 @@ const size_t TIME_RETRY_SCAN = 60 * 1000;
 // Timeout values
 const size_t SCAN_TIMEOUT = 30 * 1000;       // 30 seconds max scan time
 const size_t CONNECTION_TIMEOUT = 15 * 1000; // 15 seconds for connection operations
-const uint8_t MAX_RETRY_ATTEMPTS = 3;
+const uint8_t MAX_RETRY_ATTEMPTS = 6;
 
 // BLE state machine
 enum BLE_STATE
@@ -70,6 +90,7 @@ void initDisplay();
 void startScan();
 void hibernateDisplay();
 void writeDisplayData();
+void drawDebugBorder();
 float getBatteryVoltage();
 bool readCharacteristicsData(char *buffer, size_t buffer_size);
 void setState(BLE_STATE new_state);
@@ -103,6 +124,14 @@ void setup()
         return;
     }
 
+    // EXPERIMENT: connect at a faster FIXED interval than the Bluefruit 20ms default.
+    // More frequent connection events = faster GATT setup AND more packet-retransmit
+    // opportunities per unit time, which may harden the marginal link to the flaky
+    // Realtek/BlueZ peer. Keep min == max (FIXED): a *range* let the link come up at
+    // the slow 75ms max and broke service discovery (btmon-confirmed). If this doesn't
+    // help, delete this line to fall back to the proven-good 20ms default.
+    Bluefruit.Central.setConnIntervalMS(15, 15);
+
     service.begin();
     characteristic1.begin();
     characteristic2.begin();
@@ -114,11 +143,16 @@ void setup()
     sd_power_mode_set(NRF_POWER_MODE_LOWPWR);
 
     // battery level
+#if defined(DISPLAY_BACKEND_SEEEDGFX)
+    // EN04: default analog reference + 12-bit ADC, matching the wiki's 7.16 factor.
+    analogReadResolution(12);
+#else
     analogReference(AR_INTERNAL_2_4);
     analogReadResolution(ADC_RESOLUTION);
-    pinMode(PIN_VBAT, INPUT);
-    pinMode(VBAT_ENABLE, OUTPUT);
-    digitalWrite(VBAT_ENABLE, LOW);
+#endif
+    pinMode(BATTERY_PIN, INPUT);
+    pinMode(BATTERY_ENABLE_PIN, OUTPUT);
+    digitalWrite(BATTERY_ENABLE_PIN, BATTERY_ENABLE_ACTIVE);
 
     // init display
     initDisplay();
@@ -144,7 +178,6 @@ void loop()
     case SCANNING:
         if (Bluefruit.Scanner.isRunning())
         {
-            writeSerialWithState("Scanning for devices...");
             // Check for scan timeout
             if (hasTimedOut(SCAN_TIMEOUT))
             {
@@ -193,12 +226,73 @@ void loop()
         break;
 
     case CONNECTED:
+    {
+        // Connection setup runs here (main task context), NOT in connect_callback.
+        // Negotiating PHY / data length / MTU from the event callback caused the
+        // link to fail to establish (HCI reason 0x3E) with a garbage MTU readback.
+        if (connection == nullptr)
+        {
+            writeSerialWithState("Error: Connection lost before setup");
+            setState(ERROR_STATE);
+            break;
+        }
+
+        connection->requestPHY();
+        connection->requestDataLengthUpdate();
+        connection->requestMtuExchange(BLE_GATT_ATT_MTU_MAX);
+
+        // Wait for the MTU exchange to actually complete instead of blocking a flat
+        // 500ms. The SoftDevice processes the exchange on its own task, so getMtu()
+        // rises above the 23-byte default as soon as it lands — usually well under
+        // 500ms. Cap the wait so a stalled negotiation can't hang the state machine,
+        // and bail the moment the link drops mid-negotiation. (PHY/data-length are
+        // link-layer optimisations that settle in the background; only the MTU gates
+        // the reads below, so it's the one worth waiting on.)
+        unsigned long negotiate_deadline = millis() + 500;
+        while (millis() < negotiate_deadline)
+        {
+            if (connection == nullptr || connection->getMtu() > BLE_GATT_ATT_MTU_DEFAULT)
+            {
+                break;
+            }
+            delay(10);
+        }
+
+        // The link can drop during the negotiation window above. disconnect_callback
+        // runs in the SoftDevice context and may already have nulled `connection` and
+        // moved us out of CONNECTED. Re-validate before dereferencing `connection` or
+        // advancing — otherwise we deref a null pointer (garbage peer name / MTU 0) and
+        // clobber the ERROR state the callback just set by forcing READING_DATA.
+        if (connection == nullptr || current_state != CONNECTED)
+        {
+            writeSerialWithState("Connection dropped during setup, aborting");
+            break; // let disconnect_callback's state drive recovery
+        }
+
+        // A link whose MTU never rose past the 23-byte default is marginal: the
+        // negotiation packets didn't get through (seen with the flaky Realtek/BlueZ
+        // peer, which also leaves the peer name empty). Discovery + reads would only
+        // crawl and fail on 20-byte chunks — the 240-byte characteristics can't even be
+        // read whole — so bail and retry now instead of limping into a doomed read.
+        if (connection->getMtu() <= BLE_GATT_ATT_MTU_DEFAULT)
+        {
+            writeSerialWithState("MTU not negotiated (still " + String(connection->getMtu()) + "), marginal link — retrying");
+            connection->disconnect();
+            setState(ERROR_STATE);
+            break;
+        }
+
+        char peer_name[32] = {0};
+        connection->getPeerName(peer_name, sizeof(peer_name));
+        writeSerialWithState("Connected to " + String(peer_name) + " with MTU: " + String(connection->getMtu()));
+
         // Connection established, move to reading data
         if (!data_read_complete)
         {
             setState(READING_DATA);
         }
         break;
+    }
 
     case READING_DATA:
     {
@@ -212,7 +306,10 @@ void loop()
         if (hasTimedOut(CONNECTION_TIMEOUT))
         {
             writeSerialWithState("Data read timeout");
-            connection->disconnect();
+            if (connection != nullptr)
+            {
+                connection->disconnect();
+            }
             setState(ERROR_STATE);
             break;
         }
@@ -221,7 +318,10 @@ void loop()
         if (!service.discover(connection->handle()))
         {
             writeSerialWithState("Service discovery failed");
-            connection->disconnect();
+            if (connection != nullptr)
+            {
+                connection->disconnect();
+            }
             setState(ERROR_STATE);
             break;
         }
@@ -229,7 +329,10 @@ void loop()
         if (!service.discovered())
         {
             writeSerialWithState("Service not discovered");
-            connection->disconnect();
+            if (connection != nullptr)
+            {
+                connection->disconnect();
+            }
             setState(ERROR_STATE);
             break;
         }
@@ -239,7 +342,10 @@ void loop()
             !characteristic3.discover() || !characteristic4.discover())
         {
             writeSerialWithState("Characteristic discovery failed");
-            connection->disconnect();
+            if (connection != nullptr)
+            {
+                connection->disconnect();
+            }
             setState(ERROR_STATE);
             break;
         }
@@ -252,7 +358,10 @@ void loop()
         if (!readCharacteristicsData(buffer, BUFFER_SIZE))
         {
             writeSerialWithState("Failed to read characteristics data");
-            connection->disconnect();
+            if (connection != nullptr)
+            {
+                connection->disconnect();
+            }
             setState(ERROR_STATE);
             break;
         }
@@ -291,8 +400,7 @@ void loop()
         writeSerialWithState("Temperature inside: " + String(haData.temperature_inside));
 
         // Update display
-        digitalWrite(D0, HIGH);
-        display.init(115200, false, 2, true);
+        epd::wake();
         writeDisplayData();
         hibernateDisplay();
 
@@ -368,12 +476,8 @@ void startScan()
 
 void hibernateDisplay()
 {
-    // I don't know why these steps are needed, but there's no
-    // other chance to get below 30 uA
-    display.hibernate();
-    pinMode(D4, INPUT); // RST
-    SPI.end();
-    digitalWrite(D0, LOW);
+    // Backend-specific low-power sequence (see the display backends).
+    epd::hibernate();
 }
 
 void writeSerial(String message, bool newLine)
@@ -391,31 +495,39 @@ void writeSerial(String message, bool newLine)
     }
 }
 
+void drawDebugBorder()
+{
+#if DEBUG_DISPLAY_BORDER
+    // Full physical panel extent. If the bottom edge of THIS rectangle is missing
+    // on hardware, the panel isn't refreshing its full height — a rendering issue,
+    // not frame placement (adjusting OFFSET_* won't recover it).
+    epd::drawRect(0, 0, epd::width(), epd::height());
+    // Content window bounded by the OFFSET_* margins — tune those until this
+    // rectangle lines up with the visible opening of your picture frame.
+    epd::drawRect(OFFSET_LEFT, OFFSET_TOP,
+                  epd::width() - OFFSET_LEFT - OFFSET_RIGHT,
+                  epd::height() - OFFSET_TOP - OFFSET_BOTTOM);
+#endif
+}
+
 void initDisplay()
 {
-    // pull PWR (D0) high (Power for the ePaper Driver hat)
-    pinMode(D0, OUTPUT);
-    digitalWrite(D0, HIGH);
-
-    // display.init(115200, true, 10, false); //, true, 2, false); // initial = true this is for the small display
-    display.init(115200, true, 2, true);
-    display.setPartialWindow(0, 0, display.width(), display.height());
-    display.setTextColor(GxEPD_BLACK);
-    display.setRotation(1);
+    epd::begin(); // power on + init + defaults (rotation, black text)
+    epd::setPartialWindow();
+    epd::setTextColor();
+    epd::setRotation(1);
 
     int16_t tbx, tby;
     uint16_t tbw, tbh;
-    display.setFont(&GothamRounded_Bold32pt7b); // title
-    display.getTextBounds(title, 0, 0, &tbx, &tby, &tbw, &tbh);
+    epd::setFont(&GothamRounded_Bold32pt7b); // title
+    epd::getTextBounds(title, 0, 0, &tbx, &tby, &tbw, &tbh);
 
-    display.firstPage();
-
-    do
-    {
+    epd::render([&]()
+                {
         // print Title
-        display.setCursor(((display.width() - tbw) / 2) - tbx - 25, OFFSET_TOP + 80);
-        display.print("Scanning...");
-    } while (display.nextPage());
+        epd::setCursor(((epd::width() - tbw) / 2) - tbx - 25, OFFSET_TOP + 80);
+        epd::print("Scanning...");
+        drawDebugBorder(); });
 }
 
 void scan_callback(ble_gap_evt_adv_report_t *report)
@@ -442,18 +554,11 @@ void connect_callback(uint16_t conn_handle)
         return;
     }
 
-    // Perform connection setup operations once
-    connection->requestPHY();
-    delay(100);
-    connection->requestDataLengthUpdate();
-    delay(100);
-    connection->requestMtuExchange(BLE_GATT_ATT_MTU_MAX);
-    delay(100);
-
-    char peer_name[32] = {0};
-    connection->getPeerName(peer_name, sizeof(peer_name));
-    writeSerialWithState("Connected to " + String(peer_name) + " with MTU: " + String(connection->getMtu()));
-    delay(1000);
+    // Keep this callback minimal: it runs in the Bluefruit event-handler context.
+    // Blocking here (delays) or issuing PHY/DataLength/MTU negotiations from the
+    // callback destabilises the freshly-formed link and it fails to establish
+    // (HCI disconnect reason 0x3E). All connection setup is deferred to the
+    // CONNECTED state in loop(), which runs in the main task context.
     setState(CONNECTED);
 }
 
@@ -477,60 +582,58 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason)
 
 void printForecast(int offset_x, int offset_y, weather_icon icon, float temperature, String time)
 {
-    display.setFont(&GothamRounded_Book14pt8b);
+    epd::setFont(&GothamRounded_Book14pt8b);
 
-    display.setCursor(OFFSET_LEFT + offset_x, OFFSET_TOP + offset_y);
-    display.print(time);
+    epd::setCursor(OFFSET_LEFT + offset_x, OFFSET_TOP + offset_y);
+    epd::print(time);
 
-    display.drawBitmap(OFFSET_LEFT + offset_x + 15, OFFSET_TOP + offset_y + 8, icon, GLYPH_SIZE_WEATHER_SMALL, GLYPH_SIZE_WEATHER_SMALL, GxEPD_BLACK);
+    epd::drawBitmap(OFFSET_LEFT + offset_x + 15, OFFSET_TOP + offset_y + 8, icon, GLYPH_SIZE_WEATHER_SMALL, GLYPH_SIZE_WEATHER_SMALL);
 
     if (temperature > 9.99)
     {
-        display.setCursor(OFFSET_LEFT + offset_x + 10, OFFSET_TOP + offset_y + 10 + GLYPH_SIZE_WEATHER_SMALL + 28);
+        epd::setCursor(OFFSET_LEFT + offset_x + 10, OFFSET_TOP + offset_y + 10 + GLYPH_SIZE_WEATHER_SMALL + 28);
     }
     else
     {
-        display.setCursor(OFFSET_LEFT + offset_x + 15, OFFSET_TOP + offset_y + 10 + GLYPH_SIZE_WEATHER_SMALL + 28);
+        epd::setCursor(OFFSET_LEFT + offset_x + 15, OFFSET_TOP + offset_y + 10 + GLYPH_SIZE_WEATHER_SMALL + 28);
     }
-    display.setFont(&GothamRounded_Bold14pt8b);
-    display.printf("%.0f°C", temperature);
+    epd::setFont(&GothamRounded_Bold14pt8b);
+    epd::printf("%.0f°C", temperature);
 }
 
 void writeDisplayData()
 {
-    display.setRotation(1);
+    epd::setRotation(1);
 
-    display.setTextColor(GxEPD_BLACK);
+    epd::setTextColor();
     int16_t tbx, tby;
     uint16_t tbw, tbh;
-    display.setFont(&GothamRounded_Bold32pt7b); // title
-    display.getTextBounds(title, 0, 0, &tbx, &tby, &tbw, &tbh);
+    epd::setFont(&GothamRounded_Bold32pt7b); // title
+    epd::getTextBounds(title, 0, 0, &tbx, &tby, &tbw, &tbh);
 
-    display.firstPage();
-
-    do
-    {
+    epd::render([&]()
+                {
         // print Title
-        display.setCursor(((display.width() - tbw) / 2) - tbx, OFFSET_TOP + 80);
-        display.print(title);
+        epd::setCursor(((epd::width() - tbw) / 2) - tbx, OFFSET_TOP + 80);
+        epd::print(title);
 
         // print big weather icon and temperature
         weather_icon weather_icon = get_weather_icon(haData.weather_forecast_now);
-        display.drawBitmap(OFFSET_LEFT + 10, OFFSET_TOP + 110, weather_icon, GLYPH_SIZE_WEATHER, GLYPH_SIZE_WEATHER, GxEPD_BLACK);
-        display.setCursor(OFFSET_LEFT + 110, OFFSET_TOP + 190);
-        display.setFont(&GothamRounded_Bold48pt8b);
-        display.printf("%.1f°C", haData.temperature_outside);
+        epd::drawBitmap(OFFSET_LEFT + 10, OFFSET_TOP + 110, weather_icon, GLYPH_SIZE_WEATHER, GLYPH_SIZE_WEATHER);
+        epd::setCursor(OFFSET_LEFT + 110, OFFSET_TOP + 190);
+        epd::setFont(&GothamRounded_Bold48pt8b);
+        epd::printf("%.1f°C", haData.temperature_outside);
 
         // print humidity and wind
-        display.setFont(&GothamRounded_Bold14pt8b);
+        epd::setFont(&GothamRounded_Bold14pt8b);
         size_t weatherdetails_offset = 250;
-        display.drawBitmap(OFFSET_LEFT + 30, OFFSET_TOP + weatherdetails_offset - GLYPH_SIZE_WEATHER_SMALL / 2, weather_small_wind, GLYPH_SIZE_WEATHER_SMALL, GLYPH_SIZE_WEATHER_SMALL, GxEPD_BLACK);
-        display.setCursor(OFFSET_LEFT + 90, OFFSET_TOP + weatherdetails_offset + GLYPH_SIZE_WEATHER_SMALL / 4);
-        display.printf("%.1fkm/h", haData.wind_speed);
+        epd::drawBitmap(OFFSET_LEFT + 30, OFFSET_TOP + weatherdetails_offset - GLYPH_SIZE_WEATHER_SMALL / 2, weather_small_wind, GLYPH_SIZE_WEATHER_SMALL, GLYPH_SIZE_WEATHER_SMALL);
+        epd::setCursor(OFFSET_LEFT + 90, OFFSET_TOP + weatherdetails_offset + GLYPH_SIZE_WEATHER_SMALL / 4);
+        epd::printf("%.1fkm/h", haData.wind_speed);
 
-        display.drawBitmap(OFFSET_LEFT + 230, OFFSET_TOP + weatherdetails_offset - GLYPH_SIZE_WEATHER_SMALL / 2, icon_humidity, GLYPH_SIZE_WEATHER_SMALL, GLYPH_SIZE_WEATHER_SMALL, GxEPD_BLACK);
-        display.setCursor(OFFSET_LEFT + 290, OFFSET_TOP + weatherdetails_offset + GLYPH_SIZE_WEATHER_SMALL / 4);
-        display.printf("%.1f%%", haData.humidity_outside);
+        epd::drawBitmap(OFFSET_LEFT + 230, OFFSET_TOP + weatherdetails_offset - GLYPH_SIZE_WEATHER_SMALL / 2, icon_humidity, GLYPH_SIZE_WEATHER_SMALL, GLYPH_SIZE_WEATHER_SMALL);
+        epd::setCursor(OFFSET_LEFT + 290, OFFSET_TOP + weatherdetails_offset + GLYPH_SIZE_WEATHER_SMALL / 4);
+        epd::printf("%.1f%%", haData.humidity_outside);
 
         // print forecasts
         size_t forecast_offset_y = weatherdetails_offset + 60;
@@ -540,16 +643,16 @@ void writeDisplayData()
         printForecast(330, forecast_offset_y, get_weather_icon(haData.weather_forecast_8h, true), haData.weather_forecast_8h_temp, haData.weather_forecast_8h_time);
 
         // living room temperature
-        display.drawBitmap(OFFSET_LEFT + 30, OFFSET_TOP + 430, icon_living_room, 80, 80, GxEPD_BLACK);
-        display.drawBitmap(OFFSET_LEFT + 120, OFFSET_TOP + 430, icon40_thermometer, 40, 40, GxEPD_BLACK);
-        display.drawBitmap(OFFSET_LEFT + 120, OFFSET_TOP + 470, icon40_humidity, 40, 40, GxEPD_BLACK);
+        epd::drawBitmap(OFFSET_LEFT + 30, OFFSET_TOP + 430, icon_living_room, 80, 80);
+        epd::drawBitmap(OFFSET_LEFT + 120, OFFSET_TOP + 430, icon40_thermometer, 40, 40);
+        epd::drawBitmap(OFFSET_LEFT + 120, OFFSET_TOP + 470, icon40_humidity, 40, 40);
 
-        display.setFont(&GothamRounded_Bold14pt8b);
-        display.setCursor(OFFSET_LEFT + 165, OFFSET_TOP + 460);
-        display.printf("%.1f°C", haData.temperature_inside);
+        epd::setFont(&GothamRounded_Bold14pt8b);
+        epd::setCursor(OFFSET_LEFT + 165, OFFSET_TOP + 460);
+        epd::printf("%.1f°C", haData.temperature_inside);
 
-        display.setCursor(OFFSET_LEFT + 165, OFFSET_TOP + 500);
-        display.printf("%.1f%%", haData.humidity_inside);
+        epd::setCursor(OFFSET_LEFT + 165, OFFSET_TOP + 500);
+        epd::printf("%.1f%%", haData.humidity_inside);
 
         // dog age
         int y, M, d, h, m;
@@ -565,25 +668,52 @@ void writeDisplayData()
         int months_old = (std::difftime(now, birthday) - (years_old * 365.25 * 24 * 3600)) / (30.44 * 24 * 3600);
         int total_months_old = years_old * 12 + months_old;
 
-        display.drawBitmap(OFFSET_LEFT + 30, OFFSET_TOP + 550, image_dog, 80, 50, GxEPD_BLACK);
-        display.setCursor(OFFSET_LEFT + 120, OFFSET_TOP + 585);
-        display.printf("%d Monate", total_months_old);
+        epd::drawBitmap(OFFSET_LEFT + 30, OFFSET_TOP + 550, image_dog, 80, 50);
+        epd::setCursor(OFFSET_LEFT + 120, OFFSET_TOP + 585);
+        epd::printf("%d Monate", total_months_old);
 
-        display.setFont(&GothamRounded_Book14pt8b);
+        epd::setFont(&GothamRounded_Book14pt8b);
 
         // battery level
         float batteryVoltage = getBatteryVoltage();
-        display.setCursor(OFFSET_LEFT + 5, OFFSET_TOP + 670);
-        display.printf("%.1fV", batteryVoltage);
+        epd::setCursor(OFFSET_LEFT + 5, OFFSET_TOP + 670);
+        epd::printf("%.1fV", batteryVoltage);
 
         // last update
-        display.getTextBounds("STAND 11:11", 0, 0, &tbx, &tby, &tbw, &tbh);
-        display.setCursor(((display.width() - tbw) / 2) - tbx - 10, OFFSET_TOP + 670);
-        display.printf("STAND %s", haData.time.c_str());
+        epd::getTextBounds("STAND 11:11", 0, 0, &tbx, &tby, &tbw, &tbh);
+        epd::setCursor(((epd::width() - tbw) / 2) - tbx - 10, OFFSET_TOP + 670);
+        epd::printf("STAND %s", haData.time.c_str());
 
-        // calibrate borders
-        // display.drawRect(OFFSET_LEFT, OFFSET_TOP, display.width() - OFFSET_LEFT - OFFSET_RIGHT, display.height() - OFFSET_TOP - OFFSET_BOTTOM, GxEPD_BLACK);
-    } while (display.nextPage());
+        // calibration borders (no-op unless DEBUG_DISPLAY_BORDER is enabled)
+        drawDebugBorder(); });
+}
+
+// Read a characteristic, retrying a few times before giving up. The peer's flaky
+// Realtek/BlueZ controller intermittently drops a fragment of a large multi-packet
+// read response, so the SoftDevice errors the read and returns 0 (fast, not a timeout).
+// A fresh read of the same value almost always succeeds — retrying here recovers it on
+// the still-live link instead of tearing down the whole connection and paying the full
+// re-scan + re-discover cost. Returns 0 only if every attempt failed (or the link drops).
+static size_t readCharacteristicWithRetry(BLEClientCharacteristic &chr, char *dst,
+                                          size_t maxlen, const char *label)
+{
+    const uint8_t READ_ATTEMPTS = 4;
+    for (uint8_t attempt = 1; attempt <= READ_ATTEMPTS; attempt++)
+    {
+        size_t n = chr.read(dst, maxlen);
+        if (n > 0)
+        {
+            return n;
+        }
+        if (connection == nullptr)
+        {
+            break; // link gone — retrying is pointless
+        }
+        writeSerialWithState(String("Read ") + label + " returned 0, retry " +
+                             String(attempt) + "/" + String(READ_ATTEMPTS));
+        delay(20);
+    }
+    return 0;
 }
 
 bool readCharacteristicsData(char *buffer, size_t buffer_size)
@@ -598,7 +728,7 @@ bool readCharacteristicsData(char *buffer, size_t buffer_size)
     char *current_pos = buffer;
 
     // Read characteristic 1
-    size_t bytes_received = characteristic1.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
+    size_t bytes_received = readCharacteristicWithRetry(characteristic1, current_pos, CHARACTERISTIC_MAX_DATA_LEN, "characteristic 1");
     if (bytes_received == 0)
     {
         writeSerialWithState("Failed to read characteristic 1");
@@ -615,7 +745,7 @@ bool readCharacteristicsData(char *buffer, size_t buffer_size)
     }
 
     // Read characteristic 2
-    bytes_received = characteristic2.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
+    bytes_received = readCharacteristicWithRetry(characteristic2, current_pos, CHARACTERISTIC_MAX_DATA_LEN, "characteristic 2");
     total_bytes += bytes_received;
     current_pos += bytes_received;
 
@@ -626,7 +756,7 @@ bool readCharacteristicsData(char *buffer, size_t buffer_size)
     }
 
     // Read characteristic 3
-    bytes_received = characteristic3.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
+    bytes_received = readCharacteristicWithRetry(characteristic3, current_pos, CHARACTERISTIC_MAX_DATA_LEN, "characteristic 3");
     total_bytes += bytes_received;
     current_pos += bytes_received;
 
@@ -637,7 +767,7 @@ bool readCharacteristicsData(char *buffer, size_t buffer_size)
     }
 
     // Read characteristic 4
-    bytes_received = characteristic4.read(current_pos, CHARACTERISTIC_MAX_DATA_LEN);
+    bytes_received = readCharacteristicWithRetry(characteristic4, current_pos, CHARACTERISTIC_MAX_DATA_LEN, "characteristic 4");
     total_bytes += bytes_received;
     current_pos += bytes_received;
 
@@ -704,7 +834,16 @@ void writeSerialWithState(String message, bool newLine)
 
 float getBatteryVoltage()
 {
-    unsigned int adcCount = analogRead(PIN_VBAT);
+#if defined(DISPLAY_BACKEND_SEEEDGFX)
+    // XIAO ePaper Display Board EN04: A5 (active HIGH) enables the on-board
+    // divider on A0; the 7.16 factor folds the divider ratio and the default
+    // 12-bit reference into one calibration constant (Seeed wiki battery example).
+    delay(10); // wiki: a short settle before analogRead improves precision
+    unsigned int adcCount = analogRead(BATTERY_PIN);
+    return (adcCount / 4096.0f) * 7.16f;
+#else
+    unsigned int adcCount = analogRead(BATTERY_PIN);
     float adcVoltage = adcCount * VREF / ADC_MAX;
     return ((510e3 + 1000e3) / 510e3) * adcVoltage;
+#endif
 }

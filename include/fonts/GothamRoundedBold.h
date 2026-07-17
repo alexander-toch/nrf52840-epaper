@@ -1,5 +1,9 @@
 #pragma once
+// GFXfont/GFXglyph come from Adafruit_GFX (GxEPD2 build) or, when building
+// against Seeed_GFX, from TFT_eSPI — pulled in earlier via display/display.h.
+#if !defined(DISPLAY_BACKEND_SEEEDGFX)
 #include <Adafruit_GFX.h>
+#endif
 
 const uint8_t GothamRounded_Bold32pt7bBitmaps[] PROGMEM = {
     0x00, 0x7F, 0xE7, 0xFF, 0x7F, 0xF7, 0xFF, 0x7F, 0xF7, 0xFE, 0x7F, 0xE7,
