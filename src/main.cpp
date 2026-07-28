@@ -30,6 +30,12 @@
 #define BATTERY_ENABLE_ACTIVE LOW
 #endif
 
+// User 1 button (EN04 KEY1), active-low, internal pull-up.
+// https://wiki.seeedstudio.com/epaper_EN04/
+#if defined(DISPLAY_BACKEND_SEEEDGFX)
+#define BUTTON_REFRESH_PIN 1
+#endif
+
 // Debug: draw calibration borders (full panel outline + the OFFSET_* content
 // window) so the display can be aligned inside the physical picture frame.
 // Set to 1 to enable, or add `-D DEBUG_DISPLAY_BORDER=1` to the env's build_flags.
@@ -48,6 +54,11 @@ const size_t SCAN_TIMEOUT = 30 * 1000;       // 30 seconds max scan time
 const size_t CONNECTION_TIMEOUT = 15 * 1000; // 15 seconds for connection operations
 const uint8_t MAX_RETRY_ATTEMPTS = 6;
 
+// Radio TX power (dBm). nRF52840 max is +8. A stronger transmit toward the peer can
+// harden this marginal link and help connection establishment. RX sensitivity is fixed
+// in hardware and NOT tunable. Valid levels: -40,-20,-16,-12,-8,-4,0,2,3,4,5,6,7,8.
+const int8_t BLE_TX_POWER_DBM = 8;
+
 // BLE state machine
 enum BLE_STATE
 {
@@ -65,6 +76,14 @@ unsigned long state_start_time = 0;
 unsigned long last_refresh_time = 0;
 uint8_t retry_count = 0;
 bool data_read_complete = false;
+bool refresh_failed = false; // on-screen data is stale (last refresh episode gave up)
+
+// User 1 button (EN04 KEY1): set from a GPIO interrupt, consumed in loop(). volatile
+// because it's written in ISR context. button_last_ms debounces inside the ISR.
+#if defined(DISPLAY_BACKEND_SEEEDGFX)
+volatile bool button_refresh_requested = false;
+volatile unsigned long button_last_ms = 0;
+#endif
 
 // Advertising/Central parameters should have a global scope. Do NOT define them in 'setup' or in 'loop'
 BLEClientService service("D2EA587F-19C8-4F4C-8179-3BA0BC150B01");
@@ -89,7 +108,11 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 void initDisplay();
 void startScan();
 void hibernateDisplay();
-void writeDisplayData();
+void writeDisplayData(bool stale = false);
+void markRefreshFailed();
+#if defined(DISPLAY_BACKEND_SEEEDGFX)
+void onUserButton();
+#endif
 void drawDebugBorder();
 float getBatteryVoltage();
 bool readCharacteristicsData(char *buffer, size_t buffer_size);
@@ -132,6 +155,13 @@ void setup()
     // help, delete this line to fall back to the proven-good 20ms default.
     Bluefruit.Central.setConnIntervalMS(15, 15);
 
+    // Crank radio TX power to the nRF52840 max. Bluefruit.setTxPower() alone only drives
+    // the advertising role (unused by a central), so set the scanner/initiator role
+    // directly — that governs scanning and the connect. The live-connection role is set
+    // per-connection in the CONNECTED state once we have a handle.
+    Bluefruit.setTxPower(BLE_TX_POWER_DBM);
+    sd_ble_gap_tx_power_set(BLE_GAP_TX_POWER_ROLE_SCAN_INIT, 0, BLE_TX_POWER_DBM);
+
     service.begin();
     characteristic1.begin();
     characteristic2.begin();
@@ -154,6 +184,13 @@ void setup()
     pinMode(BATTERY_ENABLE_PIN, OUTPUT);
     digitalWrite(BATTERY_ENABLE_PIN, BATTERY_ENABLE_ACTIVE);
 
+#if defined(DISPLAY_BACKEND_SEEEDGFX)
+    // User 1 button (EN04 KEY1): press to force an immediate BLE refresh. The ISR only
+    // sets a flag; loop() acts on it. Active-low, so trigger on the falling edge.
+    pinMode(BUTTON_REFRESH_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_REFRESH_PIN), onUserButton, FALLING);
+#endif
+
     // init display
     initDisplay();
     writeSerial("setup completed");
@@ -168,6 +205,26 @@ void setup()
 void loop()
 {
     serial_enabled = bitRead(NRF_POWER->USBREGSTATUS, 0);
+
+#if defined(DISPLAY_BACKEND_SEEEDGFX)
+    // User 1 button: force a refresh now. Only acted on when IDLE (waiting for the next
+    // interval); if a refresh cycle is already running, the press is ignored.
+    if (button_refresh_requested)
+    {
+        button_refresh_requested = false;
+        if (current_state == IDLE)
+        {
+            writeSerialWithState("User button: forcing refresh");
+            retry_count = 0;
+            data_read_complete = false;
+            startScan();
+        }
+        else
+        {
+            writeSerialWithState("User button: ignored (refresh already in progress)");
+        }
+    }
+#endif
 
     switch (current_state)
     {
@@ -188,6 +245,7 @@ void loop()
                 {
                     writeSerialWithState("Max retry attempts reached, waiting longer");
                     retry_count = 0;
+                    markRefreshFailed(); // server not found — flag on-screen data stale
                     setState(IDLE);
                     // Wait longer before next attempt
                     delay(TIME_RETRY_SCAN);
@@ -236,6 +294,10 @@ void loop()
             setState(ERROR_STATE);
             break;
         }
+
+        // Max TX power on the live connection too (SCAN_INIT set in setup() only covers
+        // scanning/initiating, not the established link where the data transfer happens).
+        connection->setTxPower(BLE_TX_POWER_DBM);
 
         connection->requestPHY();
         connection->requestDataLengthUpdate();
@@ -389,6 +451,7 @@ void loop()
             {
                 writeSerialWithState("Max retries reached for invalid data");
                 retry_count = 0;
+                markRefreshFailed(); // couldn't get valid data — flag on-screen data stale
                 setState(IDLE);
                 delay(TIME_RETRY_SCAN);
                 startScan();
@@ -404,8 +467,10 @@ void loop()
         writeDisplayData();
         hibernateDisplay();
 
-        // Success - reset retry counter
+        // Success - reset retry counter and clear the stale flag (the render above,
+        // writeDisplayData() with stale=false, has already replaced any "(!)").
         retry_count = 0;
+        refresh_failed = false;
         refresh_count++;
         data_read_complete = true;
 
@@ -436,6 +501,7 @@ void loop()
         {
             writeSerialWithState("Max errors reached, long delay");
             retry_count = 0;
+            markRefreshFailed(); // connection kept failing — flag on-screen data stale
             delay(TIME_RETRY_SCAN);
         }
         else
@@ -478,6 +544,39 @@ void hibernateDisplay()
 {
     // Backend-specific low-power sequence (see the display backends).
     epd::hibernate();
+}
+
+#if defined(DISPLAY_BACKEND_SEEEDGFX)
+// GPIO interrupt for the EN04 User 1 button (KEY1, active-low). Keep it minimal: debounce
+// mechanical bounce with a coarse millis() window and set a flag consumed by loop().
+void onUserButton()
+{
+    unsigned long now = millis();
+    if (now - button_last_ms < 300)
+    {
+        return;
+    }
+    button_last_ms = now;
+    button_refresh_requested = true;
+}
+#endif
+
+// Flag the on-screen data as stale after a refresh episode is abandoned. Does ONE full
+// re-render of the last-good data with "(!)" appended — the UC8179 has no true partial
+// refresh, so this is a full-panel update. Guarded so repeated failures don't re-flash
+// the panel, and a no-op until we've shown real data at least once (refresh_count > 0)
+// so the boot "Scanning..." screen isn't clobbered with empty fields.
+void markRefreshFailed()
+{
+    if (refresh_failed || refresh_count == 0)
+    {
+        return;
+    }
+    refresh_failed = true;
+    writeSerialWithState("Refresh failed — re-rendering display as stale (!)");
+    epd::wake();
+    writeDisplayData(true);
+    hibernateDisplay();
 }
 
 void writeSerial(String message, bool newLine)
@@ -601,7 +700,7 @@ void printForecast(int offset_x, int offset_y, weather_icon icon, float temperat
     epd::printf("%.0f°C", temperature);
 }
 
-void writeDisplayData()
+void writeDisplayData(bool stale)
 {
     epd::setRotation(1);
 
@@ -679,10 +778,14 @@ void writeDisplayData()
         epd::setCursor(OFFSET_LEFT + 5, OFFSET_TOP + 670);
         epd::printf("%.1fV", batteryVoltage);
 
-        // last update
+        // last update — append "(!)" when the shown data is stale (last refresh failed)
         epd::getTextBounds("STAND 11:11", 0, 0, &tbx, &tby, &tbw, &tbh);
         epd::setCursor(((epd::width() - tbw) / 2) - tbx - 10, OFFSET_TOP + 670);
         epd::printf("STAND %s", haData.time.c_str());
+        if (stale)
+        {
+            epd::print(" (!)");
+        }
 
         // calibration borders (no-op unless DEBUG_DISPLAY_BORDER is enabled)
         drawDebugBorder(); });
