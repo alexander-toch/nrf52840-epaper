@@ -184,7 +184,6 @@ namespace epd
         g_cursor_x = x;
         g_cursor_y = y;
     }
-
     void getTextBounds(const char *str, int16_t x, int16_t y,
                        int16_t *x1, int16_t *y1, uint16_t *w, uint16_t *h)
     {
@@ -215,15 +214,28 @@ namespace epd
     }
     void print(const String &s) { print(s.c_str()); }
 
-    void drawBitmap(int16_t x, int16_t y, const uint8_t *bitmap, int16_t w, int16_t h)
+    void drawBitmap(int16_t x, int16_t y, const uint8_t *bitmap, int16_t w, int16_t h, uint8_t scale)
     {
         // 1bpp bitmap, MSB-first, rows byte-aligned (Adafruit-GFX layout). Plot
-        // set bits as black through the portrait transform.
+        // set bits as black through the portrait transform. scale replicates each
+        // source pixel scale×scale times (nearest-neighbor) since there's no
+        // higher-resolution asset for icons that need to render larger.
         int16_t byteWidth = (w + 7) / 8;
+        uint8_t s = scale < 1 ? 1 : scale;
         for (int16_t by = 0; by < h; by++)
             for (int16_t bx = 0; bx < w; bx++)
                 if (pgm_read_byte(&bitmap[by * byteWidth + bx / 8]) & (0x80 >> (bx & 7)))
-                    putPixel(x + bx, y + by);
+                {
+                    if (s <= 1)
+                        putPixel(x + bx, y + by);
+                    else
+                    {
+                        int16_t px = x + bx * s, py = y + by * s;
+                        for (uint8_t sy = 0; sy < s; sy++)
+                            for (uint8_t sx = 0; sx < s; sx++)
+                                putPixel(px + sx, py + sy);
+                    }
+                }
     }
 
     void drawRect(int16_t x, int16_t y, int16_t w, int16_t h)

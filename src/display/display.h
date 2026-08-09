@@ -55,7 +55,9 @@ namespace epd
     void print(const String &s);
 
     // --- graphics ---
-    void drawBitmap(int16_t x, int16_t y, const uint8_t *bitmap, int16_t w, int16_t h);
+    // w/h are the bitmap's native pixel size; scale replicates each source pixel
+    // scale×scale times (nearest-neighbor) so on-screen size is w*scale x h*scale.
+    void drawBitmap(int16_t x, int16_t y, const uint8_t *bitmap, int16_t w, int16_t h, uint8_t scale = 1);
     void drawRect(int16_t x, int16_t y, int16_t w, int16_t h); // outline, black
 
     // Formatted print, shared by both backends (routes to print()).

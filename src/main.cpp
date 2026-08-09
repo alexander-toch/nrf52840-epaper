@@ -9,7 +9,6 @@
 #include <fonts/GothamRoundedBoldBig.h>
 #include "home_assistant.h"
 #include "epaper.h"
-#include <ctime>
 
 // battery level
 #define VREF 2.4
@@ -741,35 +740,30 @@ void writeDisplayData(bool stale)
         printForecast(230, forecast_offset_y, get_weather_icon(haData.weather_forecast_6h, true), haData.weather_forecast_6h_temp, haData.weather_forecast_6h_time);
         printForecast(330, forecast_offset_y, get_weather_icon(haData.weather_forecast_8h, true), haData.weather_forecast_8h_temp, haData.weather_forecast_8h_time);
 
-        // living room temperature
+        // living room temperature — values print at native Bold32pt7b size (same
+        // asset resolution as everywhere else, so they stay just as crisp) rather
+        // than upscaling the small Bold14pt8b glyphs, which looked chunky.
         epd::drawBitmap(OFFSET_LEFT + 30, OFFSET_TOP + 430, icon_living_room, 80, 80);
-        epd::drawBitmap(OFFSET_LEFT + 120, OFFSET_TOP + 430, icon40_thermometer, 40, 40);
-        epd::drawBitmap(OFFSET_LEFT + 120, OFFSET_TOP + 470, icon40_humidity, 40, 40);
+        epd::drawBitmap(OFFSET_LEFT + 140, OFFSET_TOP + 440, icon_thermometer, 45, 45);
+        epd::drawBitmap(OFFSET_LEFT + 140, OFFSET_TOP + 520, icon_humidity, 45, 45);
 
-        epd::setFont(&GothamRounded_Bold14pt8b);
-        epd::setCursor(OFFSET_LEFT + 165, OFFSET_TOP + 460);
-        epd::printf("%.1f°C", haData.temperature_inside);
+        epd::setFont(&GothamRounded_Bold32pt7b);
 
-        epd::setCursor(OFFSET_LEFT + 165, OFFSET_TOP + 500);
+        // GothamRounded_Bold32pt7b has no ° glyph (its table stops at 0x7E), so
+        // the degree ring is spliced in as a small bitmap between the number and "C".
+        char tempBuf[8];
+        snprintf(tempBuf, sizeof(tempBuf), "%.1f", haData.temperature_inside);
+        int16_t tempX = OFFSET_LEFT + 200, tempY = OFFSET_TOP + 484;
+        epd::setCursor(tempX, tempY);
+        epd::print(tempBuf);
+        epd::getTextBounds(tempBuf, tempX, tempY, &tbx, &tby, &tbw, &tbh);
+        int16_t degreeX = tbx + tbw + 4;
+        epd::drawBitmap(degreeX, tempY - 40, icon_degree, 10, 10, 2);
+        epd::setCursor(degreeX + 20 + 4, tempY);
+        epd::print("C");
+
+        epd::setCursor(OFFSET_LEFT + 200, OFFSET_TOP + 564);
         epd::printf("%.1f%%", haData.humidity_inside);
-
-        // dog age
-        int y, M, d, h, m;
-        float s;
-        sscanf(haData.last_updated.c_str(), "%d-%d-%dT%d:%d:%f+00:00", &y, &M, &d, &h, &m, &s); // "2024-04-15T15:26:00.392326+00:00"
-
-        std::tm now_tm = {0, 0, 0, d, M - 1, y - 1900};
-        std::time_t now = std::mktime(&now_tm);
-        std::tm birthday_tm = {0, 0, 0, 25, 2, 2024 - 1900}; /* March 25, 2024 */
-        std::time_t birthday = std::mktime(&birthday_tm);
-
-        int years_old = std::difftime(now, birthday) / (365.25 * 24 * 3600);
-        int months_old = (std::difftime(now, birthday) - (years_old * 365.25 * 24 * 3600)) / (30.44 * 24 * 3600);
-        int total_months_old = years_old * 12 + months_old;
-
-        epd::drawBitmap(OFFSET_LEFT + 30, OFFSET_TOP + 550, image_dog, 80, 50);
-        epd::setCursor(OFFSET_LEFT + 120, OFFSET_TOP + 585);
-        epd::printf("%d Monate", total_months_old);
 
         epd::setFont(&GothamRounded_Book14pt8b);
 

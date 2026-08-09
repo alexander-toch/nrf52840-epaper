@@ -65,9 +65,20 @@ namespace epd
     void print(const char *s) { display.print(s); }
     void print(const String &s) { display.print(s); }
 
-    void drawBitmap(int16_t x, int16_t y, const uint8_t *bitmap, int16_t w, int16_t h)
+    void drawBitmap(int16_t x, int16_t y, const uint8_t *bitmap, int16_t w, int16_t h, uint8_t scale)
     {
-        display.drawBitmap(x, y, bitmap, w, h, GxEPD_BLACK);
+        if (scale <= 1)
+        {
+            display.drawBitmap(x, y, bitmap, w, h, GxEPD_BLACK);
+            return;
+        }
+        // No higher-resolution asset for icons that need to render larger, so
+        // replicate each source pixel scale×scale times (nearest-neighbor).
+        int16_t byteWidth = (w + 7) / 8;
+        for (int16_t by = 0; by < h; by++)
+            for (int16_t bx = 0; bx < w; bx++)
+                if (pgm_read_byte(&bitmap[by * byteWidth + bx / 8]) & (0x80 >> (bx & 7)))
+                    display.fillRect(x + bx * scale, y + by * scale, scale, scale, GxEPD_BLACK);
     }
 
     void drawRect(int16_t x, int16_t y, int16_t w, int16_t h)
